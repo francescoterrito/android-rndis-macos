@@ -1,0 +1,5 @@
+build/
+*.o
+.DS_Store
+# Local-only development record (kept out of the public repo).
+DOCUMENTATION.md
