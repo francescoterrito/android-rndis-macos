@@ -14,10 +14,13 @@
 #include <sys/sys_domain.h>
 #include <sys/ioctl.h>
 #include <net/if_utun.h>
+#include <sys/uio.h>
+#include <errno.h>
 
 int utun_create(char name_out[16]) {
     int fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
     if (fd < 0) return -1;
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) { close(fd); return -1; }
     struct ctl_info info;
     memset(&info, 0, sizeof(info));
     strncpy(info.ctl_name, UTUN_CONTROL_NAME, sizeof(info.ctl_name) - 1);
@@ -50,7 +53,7 @@ int utun_create(char name_out[16]) {
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
     /* Non-blocking: the TX thread polls, the RX callback must never sleep. */
     int fl = fcntl(fd, F_GETFL, 0);
-    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) { close(fd); return -1; }
     return fd;
 }
 
@@ -70,26 +73,23 @@ int utun_set_mtu(const char *ifname, int mtu) {
 }
 
 int utun_read_ip(int fd, uint8_t *buf, size_t cap) {
-    uint8_t tmp[65540];
-    ssize_t n = read(fd, tmp, sizeof(tmp));
-    if (n < 4) return -1;
     uint32_t af;
-    memcpy(&af, tmp, 4);
-    af = ntohl(af);
-    if (af != AF_INET) return 0; /* ignore v6 for now */
-    size_t len = (size_t)n - 4;
-    if (len > cap) return -1;
-    memcpy(buf, tmp + 4, len);
-    return (int)len;
+    struct iovec iov[] = {{&af, sizeof(af)}, {buf, cap}};
+    struct msghdr msg = {.msg_iov = iov, .msg_iovlen = 2};
+    ssize_t n;
+    do { n = recvmsg(fd, &msg, 0); } while (n < 0 && errno == EINTR);
+    if (n < 0)
+        return (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
+    if (n < 4 || (msg.msg_flags & MSG_TRUNC)) return -1;
+    if (ntohl(af) != AF_INET) return 0;
+    return (int)(n - 4);
 }
-
 int utun_write_ip(int fd, const uint8_t *ip, size_t len) {
-    uint8_t tmp[65540];
-    if (len + 4 > sizeof(tmp)) return -1;
+    if (len > 65535) return -1;
     uint32_t af = htonl(AF_INET);
-    memcpy(tmp, &af, 4);
-    memcpy(tmp + 4, ip, len);
-    ssize_t n = write(fd, tmp, len + 4);
+    struct iovec iov[] = {{&af, sizeof(af)}, {(void *)ip, len}};
+    ssize_t n;
+    do { n = writev(fd, iov, 2); } while (n < 0 && errno == EINTR);
     return n == (ssize_t)(len + 4) ? 0 : -1;
 }
 

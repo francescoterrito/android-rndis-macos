@@ -1,139 +1,120 @@
 #include "route.h"
 #include "log.h"
+#include "net_util.h"
+#include <SystemConfiguration/SystemConfiguration.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
-/* Proper macOS DNS: register a configd network service + override Global DNS
- * via scutil (what VPNs do). Editing /etc/resolv.conf is NOT enough — the
- * system resolver (browsers, curl) reads the SC store and ignores the file.
- * This was the "ping works, browsing doesn't" bug.
- *
- * DNS and route setup follows hknsglm/android-usb-tether-macos (MIT):
- * configd service keys State:/Network/Service/<id>/{IPv4,Interface,DNS},
- * empty SupplementalMatchDomains with SearchOrder 1, Global DNS override,
- * cache flush + mDNSResponder HUP, split-default routes, all removed on
- * exit. Differences here: no DNS backup file (restore = key removal),
- * optional second server parameter, do_route/do_dns gating in one call,
- * service id "cabled-hotspot".
- */
-#define SERVICE_ID "cabled-hotspot"
+/* Session-owned keys disappear even after a crash. Never overwrite the
+ * global DNS dictionary, which belongs to configd and other services. */
+static SCDynamicStoreRef store;
+static int routes[2];
+static char route_if[16];
+static const char *nets[] = {"0.0.0.0/1", "128.0.0.0/1"};
 
-static int g_have_route = 0;
-static int g_have_dns = 0;
-static int g_have_service = 0;
-
+static CFMutableDictionaryRef dictionary(void) {
+    return CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                      &kCFTypeDictionaryValueCallBacks);
+}
+static void string_value(CFMutableDictionaryRef d, CFStringRef key, const char *s) {
+    CFStringRef v = CFStringCreateWithCString(NULL, s, kCFStringEncodingUTF8);
+    CFDictionarySetValue(d, key, v);
+    CFRelease(v);
+}
+static void array_value(CFMutableDictionaryRef d, CFStringRef key,
+                         const char *a, const char *b) {
+    CFMutableArrayRef array = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    CFStringRef v = CFStringCreateWithCString(NULL, a, kCFStringEncodingUTF8);
+    CFArrayAppendValue(array, v); CFRelease(v);
+    if (b) {
+        v = CFStringCreateWithCString(NULL, b, kCFStringEncodingUTF8);
+        CFArrayAppendValue(array, v); CFRelease(v);
+    }
+    CFDictionarySetValue(d, key, array); CFRelease(array);
+}
+static int publish(CFStringRef entity, CFDictionaryRef value) {
+    CFStringRef key = SCDynamicStoreKeyCreateNetworkServiceEntity(NULL,
+        kSCDynamicStoreDomainState, CFSTR("android-rndis-macos"), entity);
+    Boolean ok = SCDynamicStoreSetValue(store, key, value);
+    CFRelease(key);
+    return ok ? 0 : -1;
+}
+static int route_command(const char *verb, int i) {
+    char cmd[256];
+    /* ifname is validated below and comes from the kernel. Interface
+     * routes vanish when utun closes, including after an unclean exit. */
+    snprintf(cmd, sizeof(cmd), "/sbin/route -n %s -net %s -interface %s",
+             verb, nets[i], route_if);
+    return system(cmd);
+}
 int route_setup(const char *ifname, const uint8_t ip[4], const uint8_t mask[4],
                 const uint8_t gw[4], const uint8_t dns[4], const uint8_t *dns2,
                 int do_route, int do_dns) {
-    char ips[16], msk[16], gws[16], dnss[16], dns2s[16] = "";
-    snprintf(ips, sizeof(ips), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-    snprintf(msk, sizeof(msk), "%u.%u.%u.%u", mask[0], mask[1], mask[2], mask[3]);
-    snprintf(gws, sizeof(gws), "%u.%u.%u.%u", gw[0], gw[1], gw[2], gw[3]);
-    snprintf(dnss, sizeof(dnss), "%u.%u.%u.%u", dns[0], dns[1], dns[2], dns[3]);
-    if (dns2)
-        snprintf(dns2s, sizeof(dns2s), " %u.%u.%u.%u", dns2[0], dns2[1],
-                 dns2[2], dns2[3]);
-
-    if (do_route || do_dns) {
-        /* Register network service so configd/resolver know about utun. */
-        char cmd[2048];
-        snprintf(cmd, sizeof(cmd),
-                 "scutil <<'EOF' >/dev/null 2>&1\n"
-                 "d.init\n"
-                 "d.add Addresses * %s\n"
-                 "d.add SubnetMasks * %s\n"
-                 "d.add Router %s\n"
-                 "d.add InterfaceName %s\n"
-                 "set State:/Network/Service/%s/IPv4\n"
-                 "quit\n"
-                 "EOF",
-                 ips, msk, gws, ifname, SERVICE_ID);
-        (void)system(cmd);
-        snprintf(cmd, sizeof(cmd),
-                 "scutil <<'EOF' >/dev/null 2>&1\n"
-                 "d.init\n"
-                 "d.add DeviceName %s\n"
-                 "d.add Type utun\n"
-                 "set State:/Network/Service/%s/Interface\n"
-                 "quit\n"
-                 "EOF",
-                 ifname, SERVICE_ID);
-        (void)system(cmd);
-        g_have_service = 1;
-        LOGI("registered network service '%s' on %s", SERVICE_ID, ifname);
-    }
-
-    if (do_dns) {
-        char cmd[1024];
-        /* Per-service DNS with empty supplemental match = used for all lookups. */
-        snprintf(cmd, sizeof(cmd),
-                 "scutil <<'EOF' >/dev/null 2>&1\n"
-                 "d.init\n"
-                 "d.add ServerAddresses * %s%s\n"
-                 "d.add SupplementalMatchDomains * \"\"\n"
-                 "d.add SearchOrder # 1\n"
-                 "set State:/Network/Service/%s/DNS\n"
-                 "quit\n"
-                 "EOF",
-                 dnss, dns2s, SERVICE_ID);
-        (void)system(cmd);
-        /* Global override so resolver #1 picks it up immediately. */
-        snprintf(cmd, sizeof(cmd),
-                 "scutil <<'EOF' >/dev/null 2>&1\n"
-                 "d.init\n"
-                 "d.add ServerAddresses * %s%s\n"
-                 "set State:/Network/Global/DNS\n"
-                 "quit\n"
-                 "EOF",
-                 dnss, dns2s);
-        (void)system(cmd);
-        (void)system("dscacheutil -flushcache 2>/dev/null");
-        (void)system("killall -HUP mDNSResponder 2>/dev/null");
-        g_have_dns = 1;
-        LOGI("dns -> %s%s (scutil)", dnss, dns2s);
-    }
-
+    if (store || routes[0] || routes[1]) return -1;
+    if (strncmp(ifname, "utun", 4) || !ifname[4] ||
+        strlen(ifname) >= sizeof(route_if) ||
+        strspn(ifname + 4, "0123456789") != strlen(ifname + 4)) return -1;
+    snprintf(route_if, sizeof(route_if), "%s", ifname);
+    if (!do_route && !do_dns) return 0;
     if (do_route) {
-        /* Split-default (/1s) beats the original default without destroying it. */
-        char cmd[160];
-        snprintf(cmd, sizeof(cmd),
-                 "/sbin/route add -net 0.0.0.0/1 %s >/dev/null 2>&1", gws);
-        LOGI("route 0.0.0.0/1 -> %s", gws);
-        (void)system(cmd);
-        snprintf(cmd, sizeof(cmd),
-                 "/sbin/route add -net 128.0.0.0/1 %s >/dev/null 2>&1", gws);
-        (void)system(cmd);
-        g_have_route = 1;
+        for (int i = 0; i < 2; i++) {
+            if (route_command("add", i) != 0) {
+                LOGE("cannot add %s (possibly a conflicting VPN route)", nets[i]);
+                goto fail;
+            }
+            routes[i] = 1;
+        }
+    }
+    CFMutableDictionaryRef options = dictionary();
+    CFDictionarySetValue(options, kSCDynamicStoreUseSessionKeys, kCFBooleanTrue);
+    store = SCDynamicStoreCreateWithOptions(NULL, CFSTR("AndroidRNDIS"), options, NULL, NULL);
+    CFRelease(options);
+    if (!store) goto fail;
+    if (route_update(ifname, ip, mask, gw, dns, dns2, do_route, do_dns) != 0) goto fail;
+    return 0;
+fail:
+    LOGE("network setup failed; rolling back this session");
+    route_restore();
+    return -1;
+}
+int route_update(const char *ifname, const uint8_t ip[4], const uint8_t mask[4],
+                 const uint8_t gw[4], const uint8_t dns[4], const uint8_t *dns2,
+                 int do_route, int do_dns) {
+    if (!do_route && !do_dns) return 0;
+    if (!store || strcmp(ifname, route_if)) return -1;
+    char ips[16], masks[16], gws[16], dns1s[16], dns2s[16];
+    ip_to_str(ip, ips); ip_to_str(mask, masks); ip_to_str(gw, gws);
+    ip_to_str(dns, dns1s); if (dns2) ip_to_str(dns2, dns2s);
+    CFMutableDictionaryRef d = dictionary();
+    array_value(d, kSCPropNetIPv4Addresses, ips, NULL);
+    array_value(d, kSCPropNetIPv4SubnetMasks, masks, NULL);
+    string_value(d, kSCPropInterfaceName, ifname);
+    /* Respect --no-route: do not ask configd to install a default router. */
+    if (do_route) string_value(d, kSCPropNetIPv4Router, gws);
+    int rc = publish(kSCEntNetIPv4, d); CFRelease(d);
+    if (rc) return -1;
+    d = dictionary();
+    string_value(d, kSCPropNetInterfaceDeviceName, ifname);
+    string_value(d, kSCPropNetInterfaceType, "utun");
+    rc = publish(kSCEntNetInterface, d); CFRelease(d);
+    if (rc) return -1;
+    if (do_dns) {
+        d = dictionary();
+        array_value(d, kSCPropNetDNSServerAddresses, dns1s, dns2 ? dns2s : NULL);
+        array_value(d, kSCPropNetDNSSupplementalMatchDomains, "", NULL);
+        int order = 1;
+        CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &order);
+        CFDictionarySetValue(d, kSCPropNetDNSSearchOrder, n); CFRelease(n);
+        rc = publish(kSCEntNetDNS, d); CFRelease(d);
+        if (rc) return -1;
     }
     return 0;
 }
 
 void route_restore(void) {
-    if (g_have_route) {
-        (void)system("/sbin/route delete -net 0.0.0.0/1 >/dev/null 2>&1");
-        (void)system("/sbin/route delete -net 128.0.0.0/1 >/dev/null 2>&1");
-        LOGI("routes restored");
-        g_have_route = 0;
-    }
-    if (g_have_dns) {
-        (void)system("scutil <<'EOF' >/dev/null 2>&1\n"
-                     "remove State:/Network/Global/DNS\n"
-                     "quit\n"
-                     "EOF");
-        g_have_dns = 0;
-    }
-    if (g_have_service) {
-        (void)system("scutil <<'EOF' >/dev/null 2>&1\n"
-                     "remove State:/Network/Service/" SERVICE_ID "/IPv4\n"
-                     "remove State:/Network/Service/" SERVICE_ID "/DNS\n"
-                     "remove State:/Network/Service/" SERVICE_ID "/Interface\n"
-                     "quit\n"
-                     "EOF");
-        (void)system("dscacheutil -flushcache 2>/dev/null");
-        (void)system("killall -HUP mDNSResponder 2>/dev/null");
-        LOGI("network service unregistered, dns restored");
-        g_have_service = 0;
+    if (store) { CFRelease(store); store = NULL; }
+    for (int i = 0; i < 2; i++) {
+        if (routes[i]) { (void)route_command("delete", i); routes[i] = 0; }
     }
 }

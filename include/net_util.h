@@ -84,6 +84,9 @@ static inline uint16_t get_be16(const uint8_t *p) {
     return be16(b);
 }
 
+/* Monotonic seconds including system sleep, independent of wall time. */
+double net_now(void);
+
 void mac_to_str(const uint8_t m[6], char out[18]);
 void ip_to_str(const uint8_t ip[4], char out[16]);
 int ip_from_str(const char *s, uint8_t out[4]);

@@ -134,6 +134,7 @@ int main(void) {
     eth_ip[13] = 0x00;
     memset(eth_ip + 14, 0, 20);
     eth_ip[14] = 0x45;
+    put_be16(eth_ip + 16, 20);
     rlen = 0;
     r = frame_handle_in(eth_ip, sizeof(eth_ip), ipout, sizeof(ipout), rep,
                         sizeof(rep), &rlen);
@@ -209,6 +210,127 @@ int main(void) {
     CHECK(!memcmp(res.gw, gw_ip, 4), "dhcp gw parsed");
     CHECK(res.have_dns2 && !memcmp(res.dns2, "\x08\x08\x08\x08", 4),
           "dhcp second dns parsed");
+
+    /* Malformed lengths must not use Ethernet padding as DHCP options. */
+    put_be16(oudp + 4, 8 + sizeof(*d));
+    CHECK(dhcp_parse_reply(offer, offer_len, xid, &mt, &res, pm) == -1,
+          "DHCP ignores options beyond UDP length");
+    put_be16(oudp + 4, (uint16_t)(offer_len - 34));
+    oip[0] = 0x44;
+    CHECK(dhcp_parse_reply(offer, offer_len, xid, &mt, &res, pm) == -1,
+          "DHCP rejects IHL below 20");
+    oip[0] = 0x45;
+    put_be16(oip + 6, 0x2000);
+    CHECK(dhcp_parse_reply(offer, offer_len, xid, &mt, &res, pm) == -1,
+          "DHCP rejects fragmented datagrams");
+    put_be16(oip + 6, 0);
+    /* Server identifier and router are independent (RFC 2131). */
+    memcpy(oo - 5, "\x0a\x00\x00\x01", 4);
+    CHECK(dhcp_parse_reply(offer, offer_len, xid, &mt, &res, pm) == 0 &&
+          !memcmp(res.server, "\x0a\x00\x00\x01", 4) && !memcmp(res.gw, gw_ip, 4),
+          "DHCP server identifier retained separately from router");
+    oo[-1] = 99;
+    CHECK(dhcp_parse_reply(offer, offer_len, xid, &mt, &res, pm) == -1,
+          "DHCP rejects truncated option");
+    oo[-1] = 255;
+
+    CHECK(rndis_wrap_packet(eth, SIZE_MAX, wrapped, sizeof(wrapped)) == 0,
+          "RNDIS wrap rejects size overflow");
+    struct rndis_data_hdr *rh = (struct rndis_data_hdr *)wrapped;
+    rh->data_offset = htole32(0);
+    CHECK(rndis_unwrap_packets(wrapped, wl, cb_count, ctx) == -1,
+          "RNDIS rejects data overlapping header");
+    rh->data_offset = htole32(UINT32_MAX);
+    CHECK(rndis_unwrap_packets(wrapped, wl, cb_count, ctx) == -1,
+          "RNDIS rejects overflowing data offset");
+
+    uint8_t padded[60] = {0};
+    memcpy(padded, eth_ip, sizeof(eth_ip));
+    memset(ipout, 0xaa, sizeof(ipout));
+    CHECK(frame_handle_in(padded, sizeof(padded), ipout, sizeof(ipout), rep,
+                          sizeof(rep), &rlen) == 1 && ipout[20] == 0xaa,
+          "Ethernet padding excluded from IPv4 payload");
+    padded[14] = 0x41;
+    CHECK(frame_handle_in(padded, sizeof(padded), ipout, sizeof(ipout), rep,
+                          sizeof(rep), &rlen) == -1, "invalid IPv4 header rejected");
+    CHECK(frame_wrap_out(ip, SIZE_MAX, eout, sizeof(eout)) == 0,
+          "Ethernet wrap rejects size overflow");
+    uint8_t before[6], after[6];
+    frame_get_peer(before, NULL);
+    memset(padded + 6, 0xff, 6);
+    padded[12] = 0x86; padded[13] = 0xdd;
+    frame_handle_in(padded, sizeof(padded), ipout, sizeof(ipout), rep, sizeof(rep), &rlen);
+    frame_get_peer(after, NULL);
+    CHECK(!memcmp(before, after, 6), "unknown EtherType cannot poison peer MAC");
+
+    uint8_t new_gw_ip[4] = {192, 168, 42, 1};
+    uint8_t new_gw_mac[6] = {0x02, 8, 8, 8, 8, 8};
+    uint8_t bcast[6];
+    memset(bcast, 0xff, 6);
+    frame_set_peer(bcast, new_gw_ip);
+    uint8_t arpq[42];
+    CHECK(frame_build_arp_request(arpq, sizeof(arpq)) == 42 &&
+          !memcmp(arpq + 38, new_gw_ip, 4),
+          "ARP request queries the updated gateway");
+    el = frame_wrap_out(ip, sizeof(ip), eout, sizeof(eout));
+    CHECK(el == 34 && !memcmp(eout, bcast, 6),
+          "unresolved gateway uses broadcast destination");
+    uint8_t arp_rep[42];
+    memset(arp_rep, 0, sizeof(arp_rep));
+    memcpy(arp_rep, our_mac, 6);
+    memcpy(arp_rep + 6, new_gw_mac, 6);
+    arp_rep[12] = 0x08;
+    arp_rep[13] = 0x06;
+    struct arp_pkt *ar = (struct arp_pkt *)(arp_rep + 14);
+    ar->htype[1] = 1;
+    ar->ptype[0] = 0x08;
+    ar->hlen = 6;
+    ar->plen = 4;
+    ar->oper[1] = 2;
+    memcpy(ar->sha, new_gw_mac, 6);
+    memcpy(ar->spa, new_gw_ip, 4);
+    memcpy(ar->tha, our_mac, 6);
+    memcpy(ar->tpa, our_ip, 4);
+    rlen = 0;
+    r = frame_handle_in(arp_rep, sizeof(arp_rep), ipout, sizeof(ipout),
+                        rep, sizeof(rep), &rlen);
+    uint8_t learned[6];
+    frame_get_peer(learned, NULL);
+    CHECK(r == 0 && rlen == 0 && !memcmp(learned, new_gw_mac, 6),
+          "ARP reply learns the new gateway MAC");
+    el = frame_wrap_out(ip, sizeof(ip), eout, sizeof(eout));
+    CHECK(el == 34 && !memcmp(eout, new_gw_mac, 6),
+          "resolved gateway used as Ethernet destination");
+
+    /* Three full-MTU packets fit the Samsung limit; a fourth remains unread. */
+    uint8_t large_eth[1514] = {0}, multi[4740], snapshot[4740];
+    struct rndis_batch rb;
+    rndis_batch_init(&rb, multi, sizeof(multi), 3, 1);
+    for (int i = 0; i < 3; i++) {
+        large_eth[20] = (uint8_t)i;
+        CHECK(rndis_batch_append(&rb, large_eth, sizeof(large_eth)) == 0,
+              "negotiated batch accepts full-MTU packet");
+    }
+    memcpy(snapshot, multi, rb.len);
+    CHECK(rb.len == 4674 && rndis_batch_reserve(&rb, 1514) == NULL &&
+          rndis_batch_append(&rb, large_eth, sizeof(large_eth)) == -1 &&
+          !memcmp(snapshot, multi, rb.len), "full batch refuses next packet without mutation");
+    ctx[0]=ctx[1]=0;
+    CHECK(rndis_unwrap_packets(multi, rb.len, cb_count, ctx) == 3 && ctx[1] == 4542,
+          "full-MTU batch decodes all three packets");
+    rndis_batch_init(&rb, multi, sizeof(multi), 2, 128);
+    CHECK(rndis_batch_append(&rb, eth, 100) == 0 &&
+          rndis_batch_append(&rb, eth, 100) == 0 && rb.last == 256 && rb.len == 400,
+          "negotiated 128-byte alignment pads preceding message");
+    ctx[0]=ctx[1]=0;
+    CHECK(rndis_unwrap_packets(multi, rb.len, cb_count, ctx) == 2,
+          "aligned batch decodes without losing padding boundaries");
+    rndis_batch_init(&rb, multi, sizeof(multi), 1, 8);
+    uint8_t *inplace = rndis_batch_reserve(&rb, sizeof(eth));
+    memcpy(inplace, eth, sizeof(eth));
+    CHECK(rndis_batch_append(&rb, inplace, sizeof(eth)) == 0 &&
+          rndis_batch_reserve(&rb, sizeof(eth)) == NULL,
+          "in-place batch encoding honors a one-packet device");
 
     if (fails == 0)
         printf("\nALL TESTS PASSED\n");

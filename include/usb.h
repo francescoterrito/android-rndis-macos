@@ -49,6 +49,11 @@ void usb_get_addrs(struct rndis_usb_dev *dev, int *ctrl_if, int *data_if,
 unsigned usb_get_quirks(struct rndis_usb_dev *dev);
 void usb_get_mac(struct rndis_usb_dev *dev, uint8_t mac[6]);
 size_t usb_get_max_transfer(struct rndis_usb_dev *dev);
+unsigned usb_get_max_packets(struct rndis_usb_dev *dev);
+unsigned usb_get_alignment(struct rndis_usb_dev *dev);
+struct usb_tx_pool;
+struct usb_tx_stats { uint64_t packets, bytes, transfers, errors; };
+void usb_tx_get_stats(struct usb_tx_pool *p, struct usb_tx_stats *out);
 
 /* --- Async streaming pools (performance path, used after DHCP) ---
  * Synchronous bulk transfers cap throughput at ~1 transfer per USB round
@@ -74,6 +79,7 @@ void usb_tx_release(struct usb_tx_pool *p, uint8_t *buf);
 int usb_tx_submit(struct usb_tx_pool *p, uint8_t *buf, size_t len,
                   unsigned timeout_ms);
 void usb_tx_kick(struct usb_tx_pool *p);
-void usb_tx_pool_stop(struct usb_tx_pool *p);
+/* Cancel in-flight work, drain completions, and return the final counters. */
+struct usb_tx_stats usb_tx_pool_stop(struct usb_tx_pool *p);
 
 #endif

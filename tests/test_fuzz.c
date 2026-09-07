@@ -117,6 +117,8 @@ int main(void) {
     put_be16(oudp, 67);
     put_be16(oudp + 2, 68);
     struct dhcp_fixed *d = (struct dhcp_fixed *)(oudp + 8);
+    memcpy(d->yiaddr, our_ip, 4);
+    memcpy(d->chaddr, our_mac, 6);
     d->op = 2;
     d->htype = 1;
     d->hlen = 6;
@@ -132,8 +134,14 @@ int main(void) {
     *oo++ = 53;
     *oo++ = 1;
     *oo++ = 2;
+    *oo++ = 54;
+    *oo++ = 4;
+    memcpy(oo, "\xc0\xa8\x2a\x81", 4);
+    oo += 4;
     *oo++ = 255;
     size_t olen = (size_t)(oo - offer);
+    put_be16(oip + 2, (uint16_t)(olen - 14));
+    put_be16(oudp + 4, (uint16_t)(olen - 34));
     for (int i = 0; i < 30000; i++) {
         static uint8_t mut[1024];
         size_t mlen = olen;

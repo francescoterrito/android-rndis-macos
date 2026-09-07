@@ -1,6 +1,22 @@
 #include "net_util.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#endif
+
+double net_now(void) {
+#ifdef __APPLE__
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    return (double)mach_continuous_time() * tb.numer / tb.denom / 1e9;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+#endif
+}
 
 uint16_t ip_checksum(const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;

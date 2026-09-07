@@ -37,10 +37,12 @@ struct rndis_usb_dev {
     libusb_device_handle *h;
     int ctrl_if;
     int data_if;
+    int data_alt;
     uint8_t bulk_in, bulk_out, intr_in;
+    uint16_t out_packet_size;
     unsigned quirks;
     uint8_t mac[6];
-    uint32_t max_transfer;
+    uint32_t max_transfer, max_packets, alignment;
     pthread_mutex_t ctrl_lock;
     uint16_t vid, pid;
     /* async RX pool */
@@ -69,7 +71,7 @@ static const struct usb_match *match_if(uint16_t vid, uint16_t pid,
 
 /* Scan one device: find control iface matching table + data iface with bulks. */
 static int scan_device(libusb_device *dev, int *ctrl_if, int *data_if,
-                       uint8_t *bulk_in, uint8_t *bulk_out, uint8_t *intr_in,
+                       uint8_t *bulk_in, uint8_t *bulk_out, uint8_t *intr_in, int *data_alt, uint16_t *out_packet_size,
                        const struct usb_match **mp, uint16_t *vid, uint16_t *pid) {
     struct libusb_device_descriptor dd;
     if (libusb_get_device_descriptor(dev, &dd) != 0) return -1;
@@ -103,24 +105,30 @@ static int scan_device(libusb_device *dev, int *ctrl_if, int *data_if,
             }
         }
     }
-    /* Data iface: prefer ctrl+1 with 2 bulks, else any iface with 2 bulks. */
+    /* Only CDC data interfaces: never claim ADB/MTP bulk endpoints. */
     for (int pass = 0; pass < 2 && found_ctrl >= 0 && found_data < 0; pass++) {
         for (int i = 0; i < cfg->bNumInterfaces; i++) {
             const struct libusb_interface *iface = &cfg->interface[i];
             for (int a = 0; a < iface->num_altsetting; a++) {
                 const struct libusb_interface_descriptor *d = &iface->altsetting[a];
+                if (d->bInterfaceClass != 0x0a) continue;
                 if (pass == 0 && d->bInterfaceNumber != found_ctrl + 1) continue;
                 uint8_t t_in = 0, t_out = 0;
+                uint16_t packet_size = 0;
                 for (int e = 0; e < d->bNumEndpoints; e++) {
                     const struct libusb_endpoint_descriptor *ep = &d->endpoint[e];
                     if ((ep->bmAttributes & 0x03) != 0x02) continue;
                     if (ep->bEndpointAddress & 0x80)
                         t_in = ep->bEndpointAddress;
-                    else
+                    else {
                         t_out = ep->bEndpointAddress;
+                        packet_size = ep->wMaxPacketSize & 0x7ff;
+                    }
                 }
-                if (t_in && t_out) {
+                if (t_in && t_out && packet_size) {
+                    *out_packet_size = packet_size;
                     found_data = d->bInterfaceNumber;
+                    *data_alt = d->bAlternateSetting;
                     bi = t_in;
                     bo = t_out;
                     goto done;
@@ -155,11 +163,11 @@ int usb_find_rndis(struct rndis_usb_dev **out, const struct usb_match **match) {
     struct rndis_usb_dev *dev = NULL;
     const struct usb_match *m = NULL;
     for (ssize_t i = 0; i < n && !dev; i++) {
-        int ci = -1, di = -1;
+        int ci = -1, di = -1, da = 0;
         uint8_t bi = 0, bo = 0, ii = 0;
-        uint16_t vid = 0, pid = 0;
+        uint16_t vid = 0, pid = 0, packet_size = 0;
         const struct usb_match *mm = NULL;
-        if (scan_device(list[i], &ci, &di, &bi, &bo, &ii, &mm, &vid,
+        if (scan_device(list[i], &ci, &di, &bi, &bo, &ii, &da, &packet_size, &mm, &vid,
                         &pid) != 0)
             continue;
         libusb_device_handle *h = NULL;
@@ -178,9 +186,11 @@ int usb_find_rndis(struct rndis_usb_dev **out, const struct usb_match **match) {
         dev->h = h;
         dev->ctrl_if = ci;
         dev->data_if = di;
+        dev->data_alt = da;
         dev->bulk_in = bi;
         dev->bulk_out = bo;
         dev->intr_in = ii;
+        dev->out_packet_size = packet_size;
         dev->quirks = mm ? mm->quirks : 0;
         dev->vid = vid;
         dev->pid = pid;
@@ -234,6 +244,12 @@ int usb_rndis_claim(struct rndis_usb_dev *dev) {
             return -1;
         }
     }
+    if (dev->data_alt && libusb_set_interface_alt_setting(
+            dev->h, dev->data_if, dev->data_alt) != 0) {
+        LOGE("cannot select CDC data alternate setting %d", dev->data_alt);
+        return -1;
+    }
+
     return 0;
 }
 
@@ -268,6 +284,7 @@ int rndis_command(struct rndis_usb_dev *dev, uint8_t *buf, size_t buflen) {
     if (buflen < CONTROL_BUFFER_SIZE) return -1;
     uint32_t req_type = rd32(buf);
     uint32_t req_len = rd32(buf + 4);
+    if (req_len < 12 || req_len > buflen || req_len > UINT16_MAX) return -1;
     uint32_t xid = 0;
     if (req_type != RNDIS_MSG_HALT && req_type != RNDIS_MSG_RESET) {
         xid = rndis_next_xid();
@@ -277,10 +294,15 @@ int rndis_command(struct rndis_usb_dev *dev, uint8_t *buf, size_t buflen) {
     int rc = libusb_control_transfer(dev->h, 0x21, USB_CDC_SEND_ENCAPSULATED_COMMAND,
                                      0, (uint16_t)dev->ctrl_if, buf, (uint16_t)req_len,
                                      RNDIS_CONTROL_TIMEOUT_MS);
-    if (rc < 0) {
+    if (rc != (int)req_len) {
         LOGV("SEND_ENCAP failed: %s", libusb_strerror(rc));
         pthread_mutex_unlock(&dev->ctrl_lock);
         return -1;
+    }
+    /* HALT has no completion response. */
+    if (req_type == RNDIS_MSG_HALT) {
+        pthread_mutex_unlock(&dev->ctrl_lock);
+        return 0;
     }
     if ((dev->quirks & 0x01) && dev->intr_in) {
         uint8_t notif[8];
@@ -295,14 +317,23 @@ int rndis_command(struct rndis_usb_dev *dev, uint8_t *buf, size_t buflen) {
         rc = libusb_control_transfer(dev->h, 0xA1, USB_CDC_GET_ENCAPSULATED_RESPONSE,
                                      0, (uint16_t)dev->ctrl_if, buf,
                                      (uint16_t)buflen, RNDIS_CONTROL_TIMEOUT_MS);
+        if (rc < 0) break;
         if (rc < 8) {
             usleep(40000);
             continue;
         }
-        uint32_t mt = rd32(buf), ml = rd32(buf + 4), rid = rd32(buf + 8),
-                 st = rd32(buf + 12);
-        (void)ml;
+        uint32_t mt = rd32(buf), ml = rd32(buf + 4);
+        if (ml > (uint32_t)rc || ml < 12) continue;
+        uint32_t rid = rd32(buf + 8);
+        uint32_t st = ml >= 16 ? rd32(buf + 12) : 0;
+        if (mt == RNDIS_MSG_RESET_C && mt == want) {
+            ret = rid == RNDIS_STATUS_SUCCESS ? 0 : -1;
+            break;
+        }
         if (mt == want) {
+            size_t minimum = req_type == RNDIS_MSG_INIT ? 52 :
+                             req_type == RNDIS_MSG_QUERY ? 24 : 16;
+            if (ml < minimum) break;
             if (rid != xid) {
                 LOGV("xid mismatch got %u want %u", rid, xid);
                 usleep(40000);
@@ -345,6 +376,7 @@ int rndis_command(struct rndis_usb_dev *dev, uint8_t *buf, size_t buflen) {
 
 int rndis_query(struct rndis_usb_dev *dev, uint8_t *buf, uint32_t oid,
                 uint32_t in_len, void **reply, int *reply_len) {
+    if (in_len > CONTROL_BUFFER_SIZE - 28) return -1;
     memset(buf, 0, CONTROL_BUFFER_SIZE);
     wr32(buf, RNDIS_MSG_QUERY);
     wr32(buf + 4, 28 + in_len);
@@ -354,7 +386,8 @@ int rndis_query(struct rndis_usb_dev *dev, uint8_t *buf, uint32_t oid,
     /* extra in_len bytes after header stay zero (ActiveSync pad quirk) */
     if (rndis_command(dev, buf, CONTROL_BUFFER_SIZE) != 0) return -1;
     uint32_t off = rd32(buf + 20), len = rd32(buf + 16);
-    if (off > CONTROL_BUFFER_SIZE - 8 || len > CONTROL_BUFFER_SIZE - 8 - off)
+    uint32_t message_len = rd32(buf + 4);
+    if (off < 16 || off > message_len - 8 || len > message_len - 8 - off)
         return -1;
     if (*reply_len != -1 && (int)len != *reply_len) {
         LOGV("query %08x len %u != want %d", oid, len, *reply_len);
@@ -383,8 +416,17 @@ int rndis_bind_seq(struct rndis_usb_dev *dev, uint8_t mac[6],
         return -1;
     }
     uint32_t dev_max = rd32(buf + 36);
-    LOGV("INIT ok dev_max=%u align=%u", dev_max, rd32(buf + 40));
-    if (dev_max >= 1518 + 44 && dev_max < 16384) dev->max_transfer = dev_max;
+    uint32_t max_packets = rd32(buf + 32), align = rd32(buf + 40);
+    LOGI("RNDIS limits: transfer=%u packets=%u alignment=2^%u", dev_max, max_packets, align);
+    if (align > 7) { free(buf); return -1; }
+    dev->max_packets = max_packets;
+    dev->alignment = 1u << align;
+    if (dev_max < 1514 + 44 || rd32(buf + 32) == 0) {
+        LOGE("unsupported RNDIS transfer limit %u", dev_max);
+        free(buf);
+        return -1;
+    }
+    dev->max_transfer = dev_max < 16384 ? dev_max : 16384;
 
     /* PHYSICAL_MEDIUM is optional. */
     {
@@ -411,7 +453,7 @@ int rndis_bind_seq(struct rndis_usb_dev *dev, uint8_t mac[6],
         free(buf);
         return -1;
     }
-    if (max_transfer) *max_transfer = dev->max_transfer;
+    if (max_transfer) *max_transfer = (uint32_t)usb_get_max_transfer(dev);
     free(buf);
     return 0;
 }
@@ -447,9 +489,18 @@ int rndis_keepalive(struct rndis_usb_dev *dev) {
 
 int usb_bulk_out(struct rndis_usb_dev *dev, const uint8_t *buf, size_t len,
                  unsigned timeout_ms) {
+    if (!len || len > usb_get_max_transfer(dev)) return -1;
+    uint8_t *padded = NULL;
+    if (dev->out_packet_size && len % dev->out_packet_size == 0) {
+        padded = malloc(len + 1);
+        if (!padded) return -1;
+        memcpy(padded, buf, len); padded[len++] = 0;
+        buf = padded;
+    }
     int done = 0;
     int rc = libusb_bulk_transfer(dev->h, dev->bulk_out, (uint8_t *)buf,
                                   (int)len, &done, timeout_ms);
+    free(padded);
     if (rc != 0 || (size_t)done != len) {
         LOGV("bulk-OUT %s", libusb_strerror(rc));
         return -1;
@@ -463,7 +514,7 @@ int usb_bulk_in(struct rndis_usb_dev *dev, uint8_t *buf, size_t cap,
     int rc = libusb_bulk_transfer(dev->h, dev->bulk_in, buf, (int)cap, &done,
                                   timeout_ms);
     if (rc == LIBUSB_ERROR_TIMEOUT) {
-        if (got) *got = 0;
+        if (got) *got = (size_t)done;
         return 0;
     }
     if (rc != 0) {
@@ -490,8 +541,13 @@ void usb_get_mac(struct rndis_usb_dev *dev, uint8_t mac[6]) {
 }
 
 size_t usb_get_max_transfer(struct rndis_usb_dev *dev) {
-    return dev->max_transfer;
+    /* Reserve the mandatory terminator when the limit itself is aligned. */
+    return dev->max_transfer - (dev->out_packet_size &&
+        dev->max_transfer % dev->out_packet_size == 0);
 }
+
+unsigned usb_get_max_packets(struct rndis_usb_dev *dev) { return dev->max_packets; }
+unsigned usb_get_alignment(struct rndis_usb_dev *dev) { return dev->alignment; }
 
 int usb_handle_events(struct rndis_usb_dev *dev, int timeout_ms) {
     struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
@@ -519,16 +575,17 @@ static void LIBUSB_CALL rx_complete(struct libusb_transfer *xfer) {
         break;
     case LIBUSB_TRANSFER_CANCELLED:
         break;
-    case LIBUSB_TRANSFER_STALL:
-        libusb_clear_halt(dev->h, dev->bulk_in);
-        resubmit = !dev->rx_stop;
-        break;
-    default: /* TIMEOUT/ERROR/OVERFLOW: retry while running */
-        resubmit = !dev->rx_stop;
+    default:
+        /* Blocking clear_halt is illegal in callbacks. Rebind from the
+         * supervisor instead of leaving a stalled or shrinking RX pool. */
+        atomic_store(&dev->rx_disc, 1);
         break;
     }
 
-    if (resubmit && libusb_submit_transfer(xfer) == 0) return;
+    if (resubmit) {
+        if (libusb_submit_transfer(xfer) == 0) return;
+        atomic_store(&dev->rx_disc, 1);
+    }
 
     /* terminal path: exactly one decrement per submitted transfer */
     xfer->user_data = NULL;
@@ -589,9 +646,10 @@ void usb_rx_pool_stop(struct rndis_usb_dev *dev) {
             libusb_cancel_transfer(dev->rx_slots[i].xfer);
     }
     pthread_mutex_unlock(&dev->rx_lock);
-    /* drain: pump events until every transfer reports back (max ~2s).
+    /* Drain until every cancellation callback has returned; a timeout
+     * never makes an in-flight transfer safe to free.
      * Caller must have joined the event thread first. */
-    for (int i = 0; i < 20; i++) {
+    for (;;) {
         pthread_mutex_lock(&dev->rx_lock);
         int active = dev->rx_active;
         pthread_mutex_unlock(&dev->rx_lock);
@@ -623,6 +681,7 @@ struct tx_slot {
     uint8_t *buf;
     size_t size;
     int in_use;
+    uint64_t packets, bytes;
 };
 
 struct usb_tx_pool {
@@ -633,6 +692,7 @@ struct usb_tx_pool {
     pthread_cond_t cond;
     int stop;
     int active;
+    struct usb_tx_stats stats;
 };
 
 static void LIBUSB_CALL tx_complete(struct libusb_transfer *xfer) {
@@ -640,12 +700,25 @@ static void LIBUSB_CALL tx_complete(struct libusb_transfer *xfer) {
     if (!p) return;
     if (xfer->status == LIBUSB_TRANSFER_NO_DEVICE)
         atomic_store(&p->dev->rx_disc, 1);
-    else if (xfer->status == LIBUSB_TRANSFER_STALL)
-        libusb_clear_halt(p->dev->h, p->dev->bulk_out);
+    else if (xfer->status != LIBUSB_TRANSFER_CANCELLED &&
+             (xfer->status != LIBUSB_TRANSFER_COMPLETED ||
+              xfer->actual_length != xfer->length)) {
+        LOGE("USB TX failed: status=%d bytes=%d/%d; reconnecting",
+             xfer->status, xfer->actual_length, xfer->length);
+        atomic_store(&p->dev->rx_disc, 1);
+    }
     pthread_mutex_lock(&p->lock);
     for (int i = 0; i < p->n; i++) {
         if (p->slots[i].xfer == xfer) {
-            p->slots[i].in_use = 0;
+            struct tx_slot *slot = &p->slots[i];
+            if (xfer->status == LIBUSB_TRANSFER_COMPLETED && xfer->actual_length == xfer->length) {
+                p->stats.packets += slot->packets;
+                p->stats.bytes += slot->bytes;
+                p->stats.transfers++;
+            } else if (xfer->status != LIBUSB_TRANSFER_CANCELLED) {
+                p->stats.errors++;
+            }
+            slot->in_use = 0;
             break;
         }
     }
@@ -667,6 +740,7 @@ struct usb_tx_pool *usb_tx_pool_start(struct rndis_usb_dev *dev, int n,
     p->n = n;
     pthread_mutex_init(&p->lock, NULL);
     pthread_cond_init(&p->cond, NULL);
+    int allocated = 0;
     for (int i = 0; i < n; i++) {
         p->slots[i].buf = malloc(buf_size);
         p->slots[i].xfer = p->slots[i].buf ? libusb_alloc_transfer(0) : NULL;
@@ -676,8 +750,11 @@ struct usb_tx_pool *usb_tx_pool_start(struct rndis_usb_dev *dev, int n,
             if (p->slots[i].xfer) libusb_free_transfer(p->slots[i].xfer);
             p->slots[i].buf = NULL;
             p->slots[i].xfer = NULL;
+        } else {
+            allocated++;
         }
     }
+    if (!allocated) { usb_tx_pool_stop(p); return NULL; }
     return p;
 }
 
@@ -737,6 +814,16 @@ void usb_tx_release(struct usb_tx_pool *p, uint8_t *buf) {
     pthread_mutex_unlock(&p->lock);
 }
 
+static void count_tx_frame(const uint8_t *eth, size_t n, void *ctx) {
+    struct tx_slot *slot = ctx;
+    if (n >= 34 && eth[12] == 8 && eth[13] == 0) {
+        slot->packets++; slot->bytes += n - 14;
+    }
+}
+void usb_tx_get_stats(struct usb_tx_pool *p, struct usb_tx_stats *out) {
+    pthread_mutex_lock(&p->lock); *out = p->stats; pthread_mutex_unlock(&p->lock);
+}
+
 int usb_tx_submit(struct usb_tx_pool *p, uint8_t *buf, size_t len,
                   unsigned timeout_ms) {
     struct tx_slot *slot = NULL;
@@ -747,22 +834,42 @@ int usb_tx_submit(struct usb_tx_pool *p, uint8_t *buf, size_t len,
             break;
         }
     }
-    pthread_mutex_unlock(&p->lock);
-    if (!slot || !slot->in_use) return -1;
-    libusb_fill_bulk_transfer(slot->xfer, p->dev->h, p->dev->bulk_out, buf,
-                              (int)len, tx_complete, p, timeout_ms);
-    int rc = libusb_submit_transfer(slot->xfer);
-    if (rc == LIBUSB_ERROR_NO_DEVICE) {
-        usb_tx_release(p, buf);
-        return -2;
-    }
-    if (rc != 0) {
-        usb_tx_release(p, buf);
+    if (!slot || !slot->in_use || p->stop || !len || len > slot->size ||
+        len > p->dev->max_transfer) {
+        if (slot) slot->in_use = 0;
+        pthread_cond_signal(&p->cond);
+        pthread_mutex_unlock(&p->lock);
         return -1;
     }
-    pthread_mutex_lock(&p->lock);
+    /* RNDIS requires one zero byte (not a ZLP) at exact USB packet boundaries.
+     * It is transport padding and is excluded from the last MessageLength. */
+    if (p->dev->out_packet_size && len % p->dev->out_packet_size == 0) {
+        if (len >= slot->size || len >= p->dev->max_transfer) {
+            slot->in_use = 0;
+            pthread_cond_signal(&p->cond);
+            pthread_mutex_unlock(&p->lock);
+            return -1;
+        }
+        buf[len++] = 0;
+    }
+    slot->packets = slot->bytes = 0;
+    (void)rndis_unwrap_packets(buf, len, count_tx_frame, slot);
+    libusb_fill_bulk_transfer(slot->xfer, p->dev->h, p->dev->bulk_out, buf,
+                              (int)len, tx_complete, p, timeout_ms);
+    /* Publish the active count before a completion can recycle the slot. */
     p->active++;
+    int rc = libusb_submit_transfer(slot->xfer);
+    if (rc != 0) {
+        p->active--;
+        slot->in_use = 0;
+        pthread_cond_signal(&p->cond);
+    }
     pthread_mutex_unlock(&p->lock);
+    if (rc == LIBUSB_ERROR_NO_DEVICE) {
+        atomic_store(&p->dev->rx_disc, 1);
+        return -2;
+    }
+    if (rc != 0) return -1;
     return 0;
 }
 
@@ -773,25 +880,36 @@ void usb_tx_kick(struct usb_tx_pool *p) {
     pthread_mutex_unlock(&p->lock);
 }
 
-void usb_tx_pool_stop(struct usb_tx_pool *p) {
-    if (!p) return;
+struct usb_tx_stats usb_tx_pool_stop(struct usb_tx_pool *p) {
+    struct usb_tx_stats stats = {0};
+    if (!p) return stats;
     pthread_mutex_lock(&p->lock);
     p->stop = 1;
     pthread_cond_broadcast(&p->cond);
-    for (int i = 0; i < p->n; i++) {
-        if (p->slots[i].xfer && p->slots[i].in_use)
-            libusb_cancel_transfer(p->slots[i].xfer);
-    }
     pthread_mutex_unlock(&p->lock);
-    /* drain via caller's event pumping (event thread already joined:
-     * pump here directly) */
-    for (int i = 0; i < 20; i++) {
+    /* Count in-flight completions before cancelling leftovers. */
+    for (int n = 0; n < 20; n++) {
         pthread_mutex_lock(&p->lock);
         int active = p->active;
         pthread_mutex_unlock(&p->lock);
         if (active <= 0) break;
         usb_handle_events(p->dev, 100);
     }
+    pthread_mutex_lock(&p->lock);
+    for (int i = 0; i < p->n; i++) {
+        if (p->slots[i].xfer && p->slots[i].in_use)
+            libusb_cancel_transfer(p->slots[i].xfer);
+    }
+    pthread_mutex_unlock(&p->lock);
+    /* Drain via the caller's event pumping (event thread already joined). */
+    for (;;) {
+        pthread_mutex_lock(&p->lock);
+        int active = p->active;
+        pthread_mutex_unlock(&p->lock);
+        if (active <= 0) break;
+        usb_handle_events(p->dev, 100);
+    }
+    stats = p->stats;
     for (int i = 0; i < p->n; i++) {
         if (p->slots[i].xfer) libusb_free_transfer(p->slots[i].xfer);
         free(p->slots[i].buf);
@@ -800,4 +918,5 @@ void usb_tx_pool_stop(struct usb_tx_pool *p) {
     pthread_cond_destroy(&p->cond);
     free(p->slots);
     free(p);
+    return stats;
 }

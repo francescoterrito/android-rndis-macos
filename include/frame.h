@@ -17,6 +17,11 @@ size_t frame_wrap_out(const uint8_t *ip, size_t ip_len,
                       uint8_t *eth_out, size_t cap);
 /* Build an ARP request for gateway (for learning). Returns len or 0. */
 size_t frame_build_arp_request(uint8_t *out, size_t cap);
+/* Borrow validated IPv4 payload from eth until the callback returns. */
+int frame_handle_view(const uint8_t *eth, size_t eth_len,
+                      const uint8_t **ip, size_t *ip_len,
+                      uint8_t *reply, size_t reply_cap, size_t *reply_len);
+
 /* Handle one inbound eth frame:
  *  returns 1 + fills ip_out if it carries an IP packet for utun,
  *  returns 0 if consumed (ARP etc.), -1 on error.

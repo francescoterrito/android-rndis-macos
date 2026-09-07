@@ -20,6 +20,18 @@ extern "C" {
 size_t rndis_wrap_packet(const uint8_t *eth, size_t eth_len,
                          uint8_t *out, size_t out_cap);
 
+/* Negotiated multi-message TX builder. A refused append changes nothing. */
+struct rndis_batch {
+    uint8_t *buf;
+    size_t cap, len, last;
+    unsigned packets, max_packets, alignment;
+};
+void rndis_batch_init(struct rndis_batch *b, uint8_t *buf, size_t cap,
+                       unsigned max_packets, unsigned alignment);
+/* Reserve space for one complete Ethernet frame without consuming input. */
+uint8_t *rndis_batch_reserve(struct rndis_batch *b, size_t eth_len);
+int rndis_batch_append(struct rndis_batch *b, const uint8_t *eth, size_t len);
+
 /* RX: unwrap possibly-batched RNDIS buffer from bulk-IN.
  * Calls cb(eth, eth_len, ctx) once per contained Ethernet frame.
  * Returns number of frames delivered, or -1 on framing error.
